@@ -27,6 +27,13 @@
 //   breadth    = 1 + min(chains - 1, 9) x 0.02
 //   implied    = max(1, round(base x growthMult x maturity x breadth))
 //
+// Readiness is a second, separate signal: how close a protocol looks to launching, on a 0..100
+// scale built from the same four facts the value model reads, weighted differently: size is worth
+// 30 (a $2B protocol scores the full 30, a $50M one scores 0), age 25 (three years with no token
+// scores the full 25), seven-day growth 30 (flat scores 10, +60% scores 30, -30% scores 0), and
+// breadth 15 (one chain scores 0, nine or more score 15). It never moves the ranking: it is the
+// timing read beside the value read, so a row can be worth a lot and still be early.
+//
 // TVL is the size of the business, the category multiple is what the market pays for that kind of
 // business, growth is its direction, maturity is how long it has run with no token (a protocol that
 // held billions for years without issuing is the one whose launch is overdue), and breadth is how
@@ -89,7 +96,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -117,6 +124,7 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  readiness: number;
   model: {
     category: string | null;
     category_multiple: number;
@@ -127,6 +135,8 @@ export interface BoardRow {
     maturity_multiplier: number;
     breadth_multiplier: number;
     age_days: number | null;
+    readiness: number;
+    readiness_label: string;
   };
   farm_steps: string[];
 }
@@ -150,6 +160,7 @@ export interface RadarRow {
   change_7d: number | null;
   age_days: number | null;
   implied_value_usd: number;
+  readiness: number;
   category_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
@@ -327,6 +338,31 @@ export function impliedValue(
   return { implied, categoryMultiple: multiple, compsN: n, categoryMedian: median, growthPct, growthMult, maturityMult, breadthMult, age };
 }
 
+/**
+ * How close a protocol looks to launching, 0..100, from the same four facts the value model
+ * reads, weighted for timing instead of size: size is worth 30 (a $2B protocol scores the full
+ * 30, a $50M one scores 0), age 25 (three years with no token scores the full 25), seven-day
+ * growth 30 (flat scores 10, +60% scores 30, -30% scores 0), and breadth 15 (one chain scores 0,
+ * nine or more score 15). The page recomputes the same score from the same figures, so the
+ * number on screen is the number board.json carries.
+ */
+export function readinessOf(tvlUsd: number, change7d: number | null, age: number | null, chains: number): number {
+  const size = Math.max(0, Math.min(30, (30 * Math.log10(Math.max(tvlUsd, 1) / 50_000_000)) / Math.log10(40)));
+  const ageDays = age ?? MODEL.unknown_age_days;
+  const agePts = Math.min(25, (25 * Math.min(Math.max(ageDays, 0), MODEL.maturity_days)) / MODEL.maturity_days);
+  const growth = change7d === null ? 0 : change7d;
+  const growthPts = 10 + Math.min(20, Math.max(-10, (Math.min(60, Math.max(-30, growth)) / 60) * 20));
+  const breadthPts = Math.min(15, Math.max(0, chains - 1) * 2);
+  return Math.min(100, Math.max(0, Math.round(size + agePts + growthPts + breadthPts)));
+}
+
+/** What a readiness score means: ready to watch daily, warming up, or still early. */
+export function readinessLabel(score: number): string {
+  if (score >= 70) return 'Ready';
+  if (score >= 45) return 'Warming up';
+  return 'Early';
+}
+
 /** The snapshot's protocol by slug. */
 function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
@@ -351,7 +387,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 
   const scored = [...chosen.values()].map((p) => {
     const v = impliedValue(p, snapshot.as_of, comps, globalMedian, model);
-    return { p, ...v };
+    const ready = readinessOf(p.tvl_usd, p.change_7d, v.age, p.chains.length);
+    return { p, ...v, ready };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -369,6 +406,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token' as const,
     age_days: s.age,
     implied_value_usd: s.implied,
+    readiness: s.ready,
     model: {
       category: s.p.category,
       category_multiple: round4(s.categoryMultiple),
@@ -379,6 +417,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       maturity_multiplier: round4(s.maturityMult),
       breadth_multiplier: round4(s.breadthMult),
       age_days: s.age,
+      readiness: s.ready,
+      readiness_label: readinessLabel(s.ready),
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
   }));
@@ -452,8 +492,10 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
 }
 
 /**
- * A protocol's farm plan: six steps, each an action with a cost and a time. The plan is derived from
- * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * A protocol's farm plan: eight steps, each an action with a cost and a time. The plan is derived
+ * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
+ * names. The last two steps are the same for every row: watch for the launch, then decide the exit
+ * before it happens, so the plan ends with the token instead of the position.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -492,6 +534,16 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: 'nothing but the log',
       time: '5 minutes',
     },
+    {
+      text: `Check the protocol's own announcement channels once a week, its governance forum and its social account, and note the date of any token or points announcement.`,
+      cost: 'no fee, just the weekly check',
+      time: '10 minutes a week',
+    },
+    {
+      text: `Decide the exit before the launch: how much of any airdrop to keep and how much to sell, and leave enough of the chain's gas token in the wallet to claim and move it.`,
+      cost: 'the gas token you keep back',
+      time: '10 minutes',
+    },
   ];
 }
 
@@ -524,6 +576,7 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     change_7d: row.change_7d,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    readiness: row.readiness,
     category_multiple: row.model.category_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
