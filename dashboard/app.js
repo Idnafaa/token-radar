@@ -1,8 +1,9 @@
 // Token Radar's dashboard. It reads window.RADAR (written beside dashboard/ by main.ts) and
-// renders the ranked board, a filterable table, a per-protocol detail view with the model's own
-// inputs, its live comparables and the protocol's farm plan. No network: every byte it shows is
-// in data.js. The page recomputes each row from the snapshot figures and the comps table, so the
-// number on screen is the same arithmetic board.json carries.
+// renders the ranked board, a filterable table, a top-movers strip, and a per-protocol detail view
+// with the model's own inputs, its live comparables, a launch-readiness score and the protocol's
+// farm plan. No network: every byte it shows is in data.js. The page recomputes each row from
+// the snapshot figures and the comps table, so the number on screen is the same arithmetic
+// board.json carries.
 (function () {
   'use strict';
 
@@ -77,6 +78,29 @@
     var m = DATA.model;
     var chains = row.chains && row.chains.length > 0 ? row.chains.length : 1;
     return 1 + Math.min(chains - 1, m.breadth_max_chains) * m.breadth_per_chain;
+  }
+
+  // Launch readiness, 0..100, from the same four facts the value model reads, weighted for timing
+  // instead of size: size is worth 30 (a $2B protocol scores the full 30, a $50M one scores 0),
+  // age 25 (three years with no token scores the full 25), seven-day growth 30 (flat scores 10,
+  // +60% scores 30, -30% scores 0), and breadth 15 (one chain scores 0, nine or more score 15).
+  // The page recomputes the same score from the same figures, so the number on screen is the
+  // number board.json carries. It never moves the ranking: it is the timing read beside the
+  // value read, so a row can be worth a lot and still be early.
+  function readinessOf(row) {
+    var size = Math.max(0, Math.min(30, (30 * Math.log10(Math.max(row.tvl_usd, 1) / 50000000)) / Math.log10(40)));
+    var age = row.age_days === null || row.age_days === undefined ? DATA.model.unknown_age_days : row.age_days;
+    var agePts = Math.min(25, (25 * Math.min(Math.max(age, 0), DATA.model.maturity_days)) / DATA.model.maturity_days);
+    var growth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
+    var growthPts = 10 + Math.min(20, Math.max(-10, (Math.min(60, Math.max(-30, growth)) / 60) * 20));
+    var chains = row.chains && row.chains.length > 0 ? row.chains.length : 1;
+    var breadthPts = Math.min(15, Math.max(0, chains - 1) * 2);
+    return Math.min(100, Math.max(0, Math.round(size + agePts + growthPts + breadthPts)));
+  }
+  function readinessLabel(score) {
+    if (score >= 70) return 'Ready';
+    if (score >= 45) return 'Warming up';
+    return 'Early';
   }
 
   function el(tag, attrs) {
@@ -160,7 +184,9 @@
       { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: gas + ' a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
       { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' }
+      { text: 'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.', cost: 'nothing but the log', time: '5 minutes' },
+      { text: "Check the protocol's own announcement channels once a week, its governance forum and its social account, and note the date of any token or points announcement.", cost: 'no fee, just the weekly check', time: '10 minutes a week' },
+      { text: "Decide the exit before the launch: how much of any airdrop to keep and how much to sell, and leave enough of the chain's gas token in the wallet to claim and move it.", cost: 'the gas token you keep back', time: '10 minutes' }
     ].map(stepText);
   }
 
@@ -207,6 +233,7 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
+      else if (key === 'readiness') { av = readinessOf(a); bv = readinessOf(b); }
       else if (key === 'multiple') { av = a.category_multiple; bv = b.category_multiple; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
@@ -254,6 +281,29 @@
           el('span', { class: 'spot-sub', text: 'Rank ' + r.rank + ' is ' + Math.round((r.implied_value_usd / max) * 100) + '% of the top row.' })
         );
       })
+    );
+  }
+
+  // The week's fastest growers on the board: the five pre-token rows whose TVL moved the most
+  // in seven days. Growth alone is not value — the board is still ranked by implied value — but
+  // a row that is both large and suddenly growing is the one whose launch window may be opening.
+  function movers() {
+    var top = DATA.rows.slice().sort(function (a, b) {
+      var av = a.change_7d === null ? -Infinity : a.change_7d;
+      var bv = b.change_7d === null ? -Infinity : b.change_7d;
+      return bv - av || (a.slug < b.slug ? -1 : 1);
+    }).slice(0, 5);
+    return el('section', { class: 'panel movers', 'aria-label': 'Fastest growers this week' },
+      el('h2', { text: 'Moving fastest this week' }),
+      el('p', { class: 'sub', text: 'The five pre-token rows with the strongest seven-day TVL growth. Growth is a signal, not a rank: the board below is still ordered by implied value.' }),
+      el('div', { class: 'mover-list' }, top.map(function (r) {
+        return el('button', { type: 'button', class: 'mover', onclick: function () { openDetail(r.slug); } },
+          el('span', { class: 'mover-rank', text: '#' + r.rank }),
+          el('span', { class: 'mover-name', text: r.name }),
+          el('span', { class: 'mover-growth ' + (r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
+          el('span', { class: 'mover-value', text: fmtUsd(r.implied_value_usd) + ' implied' })
+        );
+      }))
     );
   }
 
@@ -324,6 +374,7 @@
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
+        el('td', { class: 'num', text: readinessOf(r) + ' / 100' }),
         el('td', { class: 'num', text: fmtMult(r.category_multiple) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
@@ -343,6 +394,7 @@
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
+            sortHeader('readiness', 'Ready'),
             sortHeader('multiple', 'Multiple'),
             sortHeader('implied', 'Implied value'),
             el('th', { scope: 'col', text: 'Token' })
@@ -395,6 +447,7 @@
         'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.breadth_max_chains + ') x ' + m.breadth_per_chain + ') )'
       ),
       el('p', { class: 'sub', text: 'The category multiple is the median market-cap-to-TVL ratio of the live protocols in that category, each ratio first capped at the market 90th percentile of ' + fmtRatio(DATA.winsor_cap) + ', then shrunk toward the whole market median of ' + fmtRatio(DATA.global_median) + ' with weight ' + m.shrink_k + ' so a category with one or two comparables cannot price a protocol at ten times its TVL, and clamped to ' + m.multiple_floor + 'x-' + m.multiple_cap + 'x. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      el('p', { class: 'sub', text: 'Readiness is a second score, 0 to 100, built from the same four facts and weighted for timing: size is worth 30, age 25, seven-day growth 30 and breadth 15. It never moves the ranking; it is the timing read beside the value read. Every row also carries an eight-step farm plan, and the page recomputes the plan from the same figures, so the steps on screen are the steps board.json carries.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'comps' },
           el('caption', { class: 'sub', text: 'Live comparables by category: the market the multiples are calibrated on.' }),
@@ -417,6 +470,7 @@
     dialog.textContent = '';
     var steps = farmSteps(row);
     var recomputed = impliedOf(row);
+    var ready = readinessOf(row);
     var comp = compFor(row.category);
     var sameCategory = DATA.live_all.filter(function (l) { return l.category === row.category; })
       .sort(function (a, b) { return (b.mcap_usd || 0) - (a.mcap_usd || 0); }).slice(0, 3);
@@ -454,6 +508,19 @@
       el('p', { class: 'sub', text: 'This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
+      el('h3', { text: 'Launch readiness' }),
+      el('div', { class: 'equation' },
+        el('div', null, el('span', { text: 'Readiness score' }), el('b', { class: 'num', text: ready + ' / 100 · ' + readinessLabel(ready) })),
+        el('div', null, el('span', { text: 'Size, up to 30' }), el('b', { class: 'num', text: Math.max(0, Math.min(30, (30 * Math.log10(Math.max(row.tvl_usd, 1) / 50000000)) / Math.log10(40))).toFixed(1) })),
+        el('div', null, el('span', { text: 'Age with no token, up to 25' }), el('b', { class: 'num', text: (Math.min(25, (25 * Math.min(Math.max(row.age_days === null ? DATA.model.unknown_age_days : row.age_days, 0), DATA.model.maturity_days)) / DATA.model.maturity_days)).toFixed(1) })),
+        el('div', null, el('span', { text: 'Seven-day growth, up to 30' }), el('b', { class: 'num', text: (10 + Math.min(20, Math.max(-10, (Math.min(60, Math.max(-30, row.change_7d === null ? 0 : row.change_7d)) / 60) * 20))).toFixed(1) })),
+        el('div', null, el('span', { text: 'Chains, up to 15' }), el('b', { class: 'num', text: String(Math.min(15, Math.max(0, (row.chains ? row.chains.length : 1) - 1) * 2)) }))
+      ),
+      el('div', { class: 'ready-bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + ready + '%' })),
+      el('p', { class: 'sub', text: 'Readiness is timing, not value: it never moves the ranking. A row can be worth a lot and still be early, and a ready row can be small. 70 and above is ready, 45 to 69 is warming up, below 45 is early.' }),
+      el('p', { class: ready === row.readiness ? 'match' : 'mismatch', text: ready === row.readiness ? 'The page recomputes readiness as ' + ready + ' / 100, the same number board.json carries.' : 'The page recomputes readiness as ' + ready + ' / 100, which differs from the board: the data would be stale.' })
+    ));
+    dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Live comparables in ' + (row.category || 'this category') }),
       compBlock
     ));
@@ -486,6 +553,7 @@
     shell.appendChild(header());
     shell.appendChild(lede());
     shell.appendChild(spotlight());
+    shell.appendChild(movers());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') shell.appendChild(modelPanel());
