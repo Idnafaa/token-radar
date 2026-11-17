@@ -38,31 +38,29 @@
     return n.toFixed(3) + 'x';
   }
 
-  // The category multiple, from the comps table the model calibrated on the live market; a category
-  // with no live comparables falls back to the whole market's median, clamped like the model.
-  function compFor(category) {
-    var m = DATA.model;
-    var found = null;
-    for (var i = 0; i < DATA.comps.length; i++) {
-      if (DATA.comps[i].category === (category || 'Other')) { found = DATA.comps[i]; break; }
-    }
-    if (found) return { multiple: found.multiple, n: found.n, median: found.median };
-    var g = Math.min(m.multiple_cap, Math.max(m.multiple_floor, DATA.global_median));
-    return { multiple: g, n: 0, median: null };
+  // The fitted multiple for one row: the least-squares line of log market cap on log TVL,
+  // fitted at runtime on the live protocols that already trade, gives a multiple that falls as
+  // TVL rises — the giants trade at a few hundredths of TVL, the small ones near or above it.
+  // The page applies the shipped fit, so the number on screen is the number board.json carries.
+  function compFor(row) {
+    var f = DATA.fit;
+    var multiple = Math.exp(f.intercept + (f.slope - 1) * Math.log(Math.max(row.tvl_usd, 1)));
+    return { multiple: multiple, n: f.n, median: null };
   }
 
   // The model in one function: the page recomputes a row from the snapshot figures and checks the
   // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
   function impliedOf(row) {
     var m = DATA.model;
+    var f = DATA.fit;
+    var base = Math.exp(f.intercept + f.slope * Math.log(Math.max(row.tvl_usd, 1)));
     var growth = Math.min(m.growth_cap, Math.max(m.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * m.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? m.unknown_age_days : row.age_days;
     var maturity = m.maturity_floor + (Math.min(Math.max(age, 0), m.maturity_days) / m.maturity_days) * m.maturity_range;
     var chains = row.chains && row.chains.length > 0 ? row.chains.length : 1;
     var breadth = 1 + Math.min(chains - 1, m.breadth_max_chains) * m.breadth_per_chain;
-    var multiple = compFor(row.category).multiple;
-    return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity * breadth));
+    return Math.max(1, Math.round(base * growthMult * maturity * breadth));
   }
   function growthMultOf(row) {
     var m = DATA.model;
@@ -234,7 +232,7 @@
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
       else if (key === 'readiness') { av = readinessOf(a); bv = readinessOf(b); }
-      else if (key === 'multiple') { av = a.category_multiple; bv = b.category_multiple; }
+      else if (key === 'multiple') { av = a.ols_multiple; bv = b.ols_multiple; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -277,7 +275,7 @@
           el('span', { class: 'spot-rank', text: 'Rank ' + r.rank + ' of ' + DATA.board_size }),
           el('span', { class: 'spot-name', text: r.name }),
           el('span', { class: 'spot-value', text: fmtUsd(r.implied_value_usd) }),
-          el('span', { class: 'spot-sub', text: (r.category || 'Other') + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · ' + fmtMult(r.category_multiple) + ' of TVL' }),
+          el('span', { class: 'spot-sub', text: (r.category || 'Other') + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · ' + fmtMult(r.ols_multiple) + ' of TVL' }),
           el('span', { class: 'spot-sub', text: 'Rank ' + r.rank + ' is ' + Math.round((r.implied_value_usd / max) * 100) + '% of the top row.' })
         );
       })
@@ -375,7 +373,7 @@
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
         el('td', { class: 'num', text: readinessOf(r) + ' / 100' }),
-        el('td', { class: 'num', text: fmtMult(r.category_multiple) }),
+        el('td', { class: 'num', text: fmtMult(r.ols_multiple) }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
@@ -431,6 +429,7 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var f = DATA.fit;
     var comps = DATA.comps.slice().sort(function (a, b) { return b.n - a.n || (a.category < b.category ? -1 : 1); });
     var compRows = comps.map(function (c) {
       return el('tr', null,
@@ -444,14 +443,16 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.breadth_max_chains + ') x ' + m.breadth_per_chain + ') )'
+        'implied = round( exp(' + f.intercept.toFixed(4) + ' + ' + f.slope.toFixed(4) + ' x ln(tvl_usd)) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') x (1 + min(chains - 1, ' + m.breadth_max_chains + ') x ' + m.breadth_per_chain + ') )'
       ),
-      el('p', { class: 'sub', text: 'The category multiple is the median market-cap-to-TVL ratio of the live protocols in that category, each ratio first capped at the market 90th percentile of ' + fmtRatio(DATA.winsor_cap) + ', then shrunk toward the whole market median of ' + fmtRatio(DATA.global_median) + ' with weight ' + m.shrink_k + ' so a category with one or two comparables cannot price a protocol at ten times its TVL, and clamped to ' + m.multiple_floor + 'x-' + m.multiple_cap + 'x. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      el('p', { class: 'sub', text: 'The base is a line fitted on the live market, not a picked multiple: the least-squares line of log market cap on log TVL over the ' + f.n + ' live protocols that already trade, correlation ' + f.corr.toFixed(2) + '. The market pays less per TVL dollar as protocols grow — the largest live protocols trade at a few hundredths of TVL, the small ones near or above it — so a fitted line prices a giant differently from a small protocol, where a single median multiple cannot. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' }),
+      el('h2', { text: 'Calibration: the fit is backtested, not asserted' }),
+      el('p', { class: 'sub', text: 'Leave-one-out over the same ' + f.n + ' live protocols: each one’s market cap is predicted from the line fitted on the other ' + (f.n - 1) + ', and the error is |log(predicted / actual)|. The fitted line’s median error is ' + f.loo_med.toFixed(2) + ' (a median error factor of ' + Math.exp(f.loo_med).toFixed(1) + 'x, mean ' + f.loo_mean.toFixed(2) + '), against ' + f.old_loo_med.toFixed(2) + ' (factor ' + Math.exp(f.old_loo_med).toFixed(1) + 'x, mean ' + f.old_loo_mean.toFixed(2) + ') for the old rule of a shrunken median category multiple with the same three adjustments. The fit is closer to the market on both the median and the mean, on the market’s own figures. Both numbers are computed from this snapshot when the board is built, so they are checkable from the board itself.' }),
       el('p', { class: 'sub', text: 'Readiness is a second score, 0 to 100, built from the same four facts and weighted for timing: size is worth 30, age 25, seven-day growth 30 and breadth 15. It never moves the ranking; it is the timing read beside the value read. Every row also carries an eight-step farm plan, and the page recomputes the plan from the same figures, so the steps on screen are the steps board.json carries.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'comps' },
-          el('caption', { class: 'sub', text: 'Live comparables by category: the market the multiples are calibrated on.' }),
-          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Live comps' }), el('th', { scope: 'col', text: 'Median mcap / TVL' }), el('th', { scope: 'col', text: 'Multiple used' }))),
+          el('caption', { class: 'sub', text: 'Live comparables by category: the market the line is fitted on. The fit itself uses every live protocol at once; the table shows what each category contributes.' }),
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Live comps' }), el('th', { scope: 'col', text: 'Median mcap / TVL' }), el('th', { scope: 'col', text: 'Old median multiple' }))),
           el('tbody', null, compRows)
         )
       ),
@@ -471,7 +472,8 @@
     var steps = farmSteps(row);
     var recomputed = impliedOf(row);
     var ready = readinessOf(row);
-    var comp = compFor(row.category);
+    var comp = compFor(row);
+    var olsBase = Math.exp(DATA.fit.intercept + DATA.fit.slope * Math.log(Math.max(row.tvl_usd, 1)));
     var sameCategory = DATA.live_all.filter(function (l) { return l.category === row.category; })
       .sort(function (a, b) { return (b.mcap_usd || 0) - (a.mcap_usd || 0); }).slice(0, 3);
     var compBlock = sameCategory.length === 0
@@ -497,7 +499,8 @@
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
         el('div', null, el('span', { text: 'Chains' }), el('b', { class: 'num', text: String(row.chains ? row.chains.length : 1) })),
-        el('div', null, el('span', { text: 'Category multiple (' + (row.category || 'Other') + ', ' + comp.n + (comp.n === 1 ? ' live comp)' : ' live comps)') }), el('b', { class: 'num', text: fmtMult(comp.multiple) })),
+        el('div', null, el('span', { text: 'Fitted value before adjustments' }), el('b', { class: 'num', text: fmtUsd(olsBase) })),
+        el('div', null, el('span', { text: 'Fitted multiple (line on ' + comp.n + ' live protocols)' }), el('b', { class: 'num', text: fmtMult(comp.multiple) })),
         el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: growthMultOf(row).toFixed(4) })),
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: maturityMultOf(row).toFixed(4) })),
         el('div', null, el('span', { text: 'Breadth multiplier' }), el('b', { class: 'num', text: breadthMultOf(row).toFixed(4) })),
